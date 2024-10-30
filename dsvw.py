@@ -245,15 +245,22 @@ class ReqHandler(http.server.BaseHTTPRequestHandler):
             code = http.client.INTERNAL_SERVER_ERROR
         
 
+        # Finalize the request and send security headers
         finally:
             # Secure HTTP headers to mitigate various attacks
             self.send_response(code)
             self.send_header("Connection", "close")
             self.send_header("X-XSS-Protection", "0")
+            self.send_header("X-Frame-Options", "DENY")  # Prevents clickjacking
+            self.send_header("Content-Security-Policy", "frame-ancestors 'self'")  # Prevents embedding from external domains
+            self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")  # Enforces HTTPS for a year
+            self.send_header("X-Content-Type-Options", "nosniff")  # Prevent MIME type sniffing
+            self.send_header("Referrer-Policy", "no-referrer")  # Reduces referrer information exposure
             self.send_header("Content-Type", "%s%s" % ("text/html" if content.startswith("<!DOCTYPE html>") else "text/plain", "; charset=%s" % params.get("charset", "utf8")))
             self.end_headers()
             self.wfile.write(("%s%s" % (content, HTML_POSTFIX if HTML_PREFIX in content and GITHUB not in content else "")).encode())
             self.wfile.flush()
+
 
 # Run the server with threading enabled
 class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
