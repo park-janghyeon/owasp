@@ -1,3 +1,5 @@
+import hashlib, secrets
+
 #!/usr/bin/env python
 import html, http.client, http.server, io, json, os, random, re, socket, socketserver, sqlite3, string, sys, subprocess, time, traceback, urllib.parse, urllib.request, xml.etree.ElementTree, secrets
 try:
@@ -42,14 +44,62 @@ CASES = [
 ALLOWED_DOMAINS = ["example.com", "trustedsource.com"]
 SAFE_REDIRECT_URLS = ["https://example.com", "https://trusted.com"]
 
+
+# Generate a salted hash for password storage
+def hash_password(password, salt=None):
+    if not salt:
+        salt = secrets.token_hex(16)
+    hashed = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt.encode('utf-8'), 100000)
+    return f"{salt}${hashed.hex()}"
+
+# Verify a stored password against user input
+def verify_password(stored_password, provided_password):
+    salt, hashed_password = stored_password.split('$')
+    return stored_password == hash_password(provided_password, salt)
+
 # Initialize the in-memory SQLite database
 def init():
     global connection
     connection = sqlite3.connect(":memory:", isolation_level=None, check_same_thread=False)
     cursor = connection.cursor()
     cursor.execute("CREATE TABLE users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, name TEXT, surname TEXT, password TEXT)")
-    cursor.executemany("INSERT INTO users(id, username, name, surname, password) VALUES(NULL, ?, ?, ?, ?)", ((_.findtext("username"), _.findtext("name"), _.findtext("surname"), _.findtext("password")) for _ in xml.etree.ElementTree.fromstring(USERS_XML).findall("user")))
+    # Store hashed passwords instead of plaintext
+    users_data = [
+        ('admin', 'admin', 'admin', hash_password('7en8aiDoh!')),
+        ('dricci', 'dian', 'ricci', hash_password('12345')),
+        ('amason', 'anthony', 'mason', hash_password('gandalf')),
+        ('svargas', 'sandra', 'vargas', hash_password('phest1945')),
+    ]
+    cursor.executemany("INSERT INTO users(id, username, name, surname, password) VALUES(NULL, ?, ?, ?, ?)", users_data)
     cursor.execute("CREATE TABLE comments(id INTEGER PRIMARY KEY AUTOINCREMENT, comment TEXT, time TEXT)")
+    # Track failed login attempts for lockout functionality
+    cursor.execute("CREATE TABLE login_attempts(username TEXT, attempts INTEGER, last_attempt TIMESTAMP)")
+
+
+# Check login attempts and implement lockout after multiple failed attempts
+def check_login_attempts(username):
+    cursor = connection.cursor()
+    cursor.execute("SELECT attempts, last_attempt FROM login_attempts WHERE username=?", (username,))
+    result = cursor.fetchone()
+    if result:
+        attempts, last_attempt = result
+        # Lock account if attempts exceed 5 within a specific timeframe
+        if attempts >= 5 and (time.time() - last_attempt) < 900:  # 15-minute lockout
+            return False
+    return True
+
+# Update login attempts in case of failed login
+def update_login_attempts(username, success):
+    cursor = connection.cursor()
+    if success:
+        cursor.execute("DELETE FROM login_attempts WHERE username=?", (username,))
+    else:
+        cursor.execute("SELECT attempts FROM login_attempts WHERE username=?", (username,))
+        result = cursor.fetchone()
+        if result:
+            cursor.execute("UPDATE login_attempts SET attempts=attempts+1, last_attempt=? WHERE username=?", (time.time(), username))
+        else:
+            cursor.execute("INSERT INTO login_attempts(username, attempts, last_attempt) VALUES(?, ?, ?)", (username, 1, time.time()))
 
 # Allowlist domain checking for SSRF prevention (R07/T07)
 def is_allowed_domain(url):
@@ -173,9 +223,20 @@ class ReqHandler(http.server.BaseHTTPRequestHandler):
             
             # Parameterized query to prevent SQL Injection in login (R01/T01)
             elif path == "/login":
-                cursor.execute("SELECT * FROM users WHERE username=? AND password=?", (params.get("username", ""), params.get("password", "")))
-                content += "Welcome <b>%s</b><meta http-equiv=\"Set-Cookie\" content=\"SESSIONID=%s; path=/\"><meta http-equiv=\"refresh\" content=\"1; url=/\"/>" % (html.escape(params.get("username", "")), "".join(random.sample(string.ascii_letters + string.digits, 20))) if cursor.fetchall() else "The username and/or password is incorrect<meta http-equiv=\"Set-Cookie\" content=\"SESSIONID=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT\">"
-            
+                        username, password = params.get("username", ""), params.get("password", "")
+                        if not check_login_attempts(username):
+                            content += "Account locked. Too many failed attempts. Try again later."
+                        else:
+                            cursor.execute("SELECT password FROM users WHERE username=?", (username,))
+                            stored_password = cursor.fetchone()
+                            if stored_password and verify_password(stored_password[0], password):
+                                update_login_attempts(username, True)  # Reset attempts after successful login
+                                session_token = "".join(random.sample(string.ascii_letters + string.digits, 20))
+                                content += "Welcome <b>%s</b><meta http-equiv=\"Set-Cookie\" content=\"SESSIONID=%s; path=/; HttpOnly; Secure\"><meta http-equiv=\"refresh\" content=\"1; url=/\"/>" % (html.escape(username), session_token)
+                            else:
+                                update_login_attempts(username, False)
+                                content += "The username and/or password is incorrect.<meta http-equiv=\"Set-Cookie\" content=\"SESSIONID=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT\">"
+
             else:
                 code = http.client.NOT_FOUND
         
@@ -183,6 +244,7 @@ class ReqHandler(http.server.BaseHTTPRequestHandler):
             content = ex.output if isinstance(ex, subprocess.CalledProcessError) else traceback.format_exc()
             code = http.client.INTERNAL_SERVER_ERROR
         
+
         finally:
             # Secure HTTP headers to mitigate various attacks
             self.send_response(code)
